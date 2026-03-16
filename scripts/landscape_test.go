@@ -537,3 +537,321 @@ func TestDownloadLogo_Success(t *testing.T) {
 		t.Errorf("file content = %q, want %q", string(data), "<svg>test</svg>")
 	}
 }
+
+// --- Edge Case Tests ---
+
+func TestIdempotentSecondPath(t *testing.T) {
+	// Start with a landscape entry WITHOUT second_path
+	fixture := `landscape:
+  - category:
+    name: Platform
+    subcategories:
+      - subcategory:
+        name: Certified Kubernetes - Distribution
+        items:
+          - item:
+            name: TestPlatform
+            description: A test platform.
+            homepage_url: https://test.example.com
+            logo: test.svg
+            crunchbase: https://www.crunchbase.com/organization/test
+`
+	// Step 1: Find the entry, confirm no AI Platform second_path
+	entry, err := findEntryInLandscape([]byte(fixture), "https://test.example.com")
+	if err != nil {
+		t.Fatalf("step 1: unexpected error: %v", err)
+	}
+	if entry == nil {
+		t.Fatal("step 1: expected to find entry, got nil")
+	}
+	if entry.HasAIPlatformSecondPath {
+		t.Fatal("step 1: HasAIPlatformSecondPath should be false before insertion")
+	}
+
+	// Step 2: Insert second_path
+	modified := insertSecondPath([]byte(fixture), entry)
+	modifiedStr := string(modified)
+	if !strings.Contains(modifiedStr, "second_path:") {
+		t.Fatal("step 2: modified data should contain 'second_path:'")
+	}
+	if !strings.Contains(modifiedStr, "Certified Kubernetes - AI Platform") {
+		t.Fatal("step 2: modified data should contain AI Platform path")
+	}
+
+	// Step 3: Find the entry again in the MODIFIED data
+	entry2, err := findEntryInLandscape(modified, "https://test.example.com")
+	if err != nil {
+		t.Fatalf("step 3: unexpected error: %v", err)
+	}
+	if entry2 == nil {
+		t.Fatal("step 3: expected to find entry in modified data, got nil")
+	}
+	if !entry2.HasAIPlatformSecondPath {
+		t.Fatal("step 3: HasAIPlatformSecondPath should be true after insertion")
+	}
+
+	// Step 4: Insert again — should be idempotent (unchanged)
+	result := insertSecondPath(modified, entry2)
+	if string(result) != string(modified) {
+		t.Error("step 4: second insertSecondPath should return data unchanged (idempotent)")
+	}
+}
+
+func TestURLNormalizationEdgeCases(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty string", "", ""},
+		{"URL with port", "https://example.com:8080/path/", "https://example.com:8080/path"},
+		{"URL with query params", "https://example.com/path?foo=bar", "https://example.com/path?foo=bar"},
+		{"URL with fragment", "https://example.com/path#section", "https://example.com/path#section"},
+		{"URL without scheme", "example.com", "example.com"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeURL(tc.input)
+			if got != tc.want {
+				t.Errorf("normalizeURL(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMissingMetadataFields(t *testing.T) {
+	t.Run("missing vendorName succeeds", func(t *testing.T) {
+		input := []byte(`
+metadata:
+  platformName: "TestPlatform"
+  description: "A test platform."
+spec:
+  accelerators: []
+`)
+		meta, err := parseProductYAML(input)
+		if err != nil {
+			t.Fatalf("expected success, got error: %v", err)
+		}
+		if meta.VendorName != "" {
+			t.Errorf("VendorName = %q, want empty", meta.VendorName)
+		}
+		if meta.PlatformName != "TestPlatform" {
+			t.Errorf("PlatformName = %q, want %q", meta.PlatformName, "TestPlatform")
+		}
+	})
+
+	t.Run("missing description succeeds", func(t *testing.T) {
+		input := []byte(`
+metadata:
+  platformName: "TestPlatform"
+  vendorName: "TestVendor"
+spec:
+  accelerators: []
+`)
+		meta, err := parseProductYAML(input)
+		if err != nil {
+			t.Fatalf("expected success, got error: %v", err)
+		}
+		if meta.Description != "" {
+			t.Errorf("Description = %q, want empty", meta.Description)
+		}
+	})
+
+	t.Run("missing productLogoUrl succeeds", func(t *testing.T) {
+		input := []byte(`
+metadata:
+  platformName: "TestPlatform"
+  vendorName: "TestVendor"
+  description: "A test."
+spec:
+  accelerators: []
+`)
+		meta, err := parseProductYAML(input)
+		if err != nil {
+			t.Fatalf("expected success, got error: %v", err)
+		}
+		if meta.ProductLogoURL != "" {
+			t.Errorf("ProductLogoURL = %q, want empty", meta.ProductLogoURL)
+		}
+	})
+
+	t.Run("empty metadata section errors", func(t *testing.T) {
+		input := []byte(`
+metadata:
+spec:
+  accelerators: []
+`)
+		_, err := parseProductYAML(input)
+		if err == nil {
+			t.Fatal("expected error for empty metadata section, got nil")
+		}
+	})
+
+	t.Run("invalid YAML errors", func(t *testing.T) {
+		input := []byte(`not: valid: yaml: [[[`)
+		_, err := parseProductYAML(input)
+		if err == nil {
+			t.Fatal("expected error for invalid YAML, got nil")
+		}
+	})
+}
+
+func TestFindEntryInLandscapeWithRealFormat(t *testing.T) {
+	realFixture := `landscape:
+  - category:
+    name: Platform
+    subcategories:
+      - subcategory:
+        name: Certified Kubernetes - Distribution
+        items:
+          - item:
+            name: Red Hat OpenShift
+            description: OpenShift® helps organizations focus on building and scaling their business with fully supported enterprise Kubernetes by Red Hat®.
+            homepage_url: https://www.redhat.com/en/technologies/cloud-computing/openshift
+            repo_url: https://github.com/openshift/kubernetes
+            logo: red-hat-open-shift.svg
+            twitter: https://twitter.com/openshift
+            crunchbase: https://www.crunchbase.com/organization/red-hat
+            second_path:
+              - "Platform / Certified Kubernetes - AI Platform"
+          - item:
+            name: RKE Government
+            description: A Kubernetes distribution focused on enabling Federal government compliance-based use cases.
+            homepage_url: https://docs.rke2.io/
+            repo_url: https://github.com/rancher/rke2
+            logo: rke-government.svg
+            crunchbase: https://www.crunchbase.com/organization/suse
+      - subcategory:
+        name: Certified Kubernetes - AI Platform
+        items: []
+`
+
+	t.Run("find OpenShift with AI Platform second_path", func(t *testing.T) {
+		entry, err := findEntryInLandscape([]byte(realFixture),
+			"https://www.redhat.com/en/technologies/cloud-computing/openshift")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if entry == nil {
+			t.Fatal("expected to find OpenShift entry, got nil")
+		}
+		if entry.Name != "Red Hat OpenShift" {
+			t.Errorf("Name = %q, want %q", entry.Name, "Red Hat OpenShift")
+		}
+		if !entry.HasAIPlatformSecondPath {
+			t.Error("OpenShift should have HasAIPlatformSecondPath=true")
+		}
+	})
+
+	t.Run("find RKE Government without AI Platform second_path", func(t *testing.T) {
+		entry, err := findEntryInLandscape([]byte(realFixture),
+			"https://docs.rke2.io/")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if entry == nil {
+			t.Fatal("expected to find RKE Government entry, got nil")
+		}
+		if entry.Name != "RKE Government" {
+			t.Errorf("Name = %q, want %q", entry.Name, "RKE Government")
+		}
+		if entry.HasAIPlatformSecondPath {
+			t.Error("RKE Government should have HasAIPlatformSecondPath=false")
+		}
+	})
+
+	t.Run("insertSecondPath on RKE Government produces valid output", func(t *testing.T) {
+		entry, err := findEntryInLandscape([]byte(realFixture),
+			"https://docs.rke2.io/")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if entry == nil {
+			t.Fatal("expected to find RKE Government entry")
+		}
+
+		result := insertSecondPath([]byte(realFixture), entry)
+		resultStr := string(result)
+
+		// Should contain second_path with proper indentation
+		if !strings.Contains(resultStr, "second_path:") {
+			t.Error("result should contain 'second_path:'")
+		}
+		if !strings.Contains(resultStr, `"Platform / Certified Kubernetes - AI Platform"`) {
+			t.Error("result should contain AI Platform second_path value")
+		}
+
+		// Verify proper indentation: 12 spaces for second_path key
+		lines := strings.Split(resultStr, "\n")
+		foundKey := false
+		for i, line := range lines {
+			// Find the NEW second_path (for RKE Government, not OpenShift's existing one)
+			if strings.TrimSpace(line) == "second_path:" {
+				// Check if this follows the RKE Government crunchbase line
+				if i > 0 && strings.Contains(lines[i-1], "suse") {
+					foundKey = true
+					if !strings.HasPrefix(line, "            second_path:") {
+						t.Errorf("second_path key not properly indented: %q", line)
+					}
+					if i+1 < len(lines) {
+						nextLine := lines[i+1]
+						if !strings.HasPrefix(nextLine, "              - ") {
+							t.Errorf("second_path list item not properly indented: %q", nextLine)
+						}
+					}
+				}
+			}
+		}
+		if !foundKey {
+			t.Error("did not find properly placed second_path for RKE Government")
+		}
+	})
+}
+
+func TestSanitizeBranchName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "normal name",
+			input: "OpenShift Container Platform",
+			want:  "openshift-container-platform",
+		},
+		{
+			name:  "special characters",
+			input: "Platform (v2.0) #1",
+			want:  "platform-v2-0-1",
+		},
+		{
+			name:  "empty string",
+			input: "",
+			want:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeBranchName(tc.input)
+			if got != tc.want {
+				t.Errorf("sanitizeBranchName(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+
+	// Long name test: verify truncation to max 50 chars and no trailing dash
+	t.Run("long name truncated to 50 chars max", func(t *testing.T) {
+		longName := "This Is A Very Long Platform Name That Should Definitely Be Truncated To Fifty Characters"
+		got := sanitizeBranchName(longName)
+		if len(got) > 50 {
+			t.Errorf("sanitizeBranchName(%q) length = %d, want <= 50", longName, len(got))
+		}
+		if strings.HasSuffix(got, "-") {
+			t.Errorf("sanitizeBranchName(%q) = %q, should not end with '-'", longName, got)
+		}
+		if got == "" {
+			t.Error("sanitizeBranchName of long name should not be empty")
+		}
+	})
+}
