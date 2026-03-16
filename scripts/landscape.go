@@ -5,11 +5,15 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -258,12 +262,9 @@ func insertSecondPath(data []byte, entry *LandscapeEntry) []byte {
 	// Determine if the entry already has a second_path key by scanning entry lines
 	hasSecondPath := false
 	for i := entry.ItemLineIndex; i <= entry.LastFieldLineIndex && i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) == "second_path:" || strings.Contains(lines[i], "second_path:") {
-			trimmed := strings.TrimSpace(lines[i])
-			if trimmed == "second_path:" {
-				hasSecondPath = true
-				break
-			}
+		if strings.TrimSpace(lines[i]) == "second_path:" {
+			hasSecondPath = true
+			break
 		}
 	}
 
@@ -303,16 +304,17 @@ func insertNewEntry(data []byte, meta *ProductMeta, logoFilename string) ([]byte
 
 	// Build the entry block
 	homepageURL := meta.WebsiteURL
-	if homepageURL == "" {
-		homepageURL = ""
-	}
 
-	entryBlock := fmt.Sprintf(`          - item:
-            name: %s
-            description: >-
-              %s
-            homepage_url: %s
-            logo: %s`, meta.PlatformName, meta.Description, homepageURL, logoFilename)
+	// Sanitize description: collapse to single line, escape for YAML
+	desc := strings.ReplaceAll(meta.Description, "\n", " ")
+	desc = strings.Join(strings.Fields(desc), " ")
+
+	entryBlock := fmt.Sprintf("          - item:\n"+
+		"            name: %s\n"+
+		"            description: >-\n"+
+		"              %s\n"+
+		"            homepage_url: %s\n"+
+		"            logo: %s", meta.PlatformName, desc, homepageURL, logoFilename)
 
 	// Look for "Certified Kubernetes - AI Platform" subcategory
 	lines := strings.Split(content, "\n")
@@ -380,7 +382,8 @@ func insertNewEntry(data []byte, meta *ProductMeta, logoFilename string) ([]byte
 // downloadLogo fetches a logo from a URL and writes it to destPath.
 // Returns an error on HTTP 4xx/5xx responses.
 func downloadLogo(logoURL, destPath string) error {
-	resp, err := http.Get(logoURL)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(logoURL)
 	if err != nil {
 		return fmt.Errorf("downloading logo from %s: %w", logoURL, err)
 	}
@@ -394,11 +397,195 @@ func downloadLogo(logoURL, destPath string) error {
 	if err != nil {
 		return fmt.Errorf("creating logo file %s: %w", destPath, err)
 	}
-	defer f.Close()
 
 	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(destPath)
 		return fmt.Errorf("writing logo to %s: %w", destPath, err)
 	}
 
-	return nil
+	return f.Close()
+}
+
+// sanitizeBranchName converts a name to a safe git branch suffix.
+// Lowercase, non-alphanumeric characters replaced with dashes, max 50 chars.
+func sanitizeBranchName(name string) string {
+	s := strings.ToLower(name)
+	s = nonAlphanumeric.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if len(s) > 50 {
+		s = s[:50]
+		s = strings.TrimRight(s, "-")
+	}
+	return s
+}
+
+// runCmd runs an external command, piping stdout and stderr to os.Stdout/os.Stderr.
+func runCmd(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// runCmdInDir runs an external command in the specified directory,
+// piping stdout and stderr to os.Stdout/os.Stderr.
+func runCmdInDir(dir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: go run -tags landscape scripts/landscape.go <PRODUCT.yaml path> [--pr-url <url>]")
+	}
+
+	productPath := os.Args[1]
+	var prURL string
+	for i := 2; i < len(os.Args); i++ {
+		if os.Args[i] == "--pr-url" && i+1 < len(os.Args) {
+			prURL = os.Args[i+1]
+			i++
+		}
+	}
+
+	// 1. Read and parse PRODUCT.yaml
+	data, err := os.ReadFile(productPath)
+	if err != nil {
+		log.Fatalf("Reading PRODUCT.yaml: %v", err)
+	}
+
+	meta, err := parseProductYAML(data)
+	if err != nil {
+		log.Fatalf("Parsing PRODUCT.yaml: %v", err)
+	}
+	log.Printf("Parsed product: %s by %s (k8s %s)", meta.PlatformName, meta.VendorName, meta.KubernetesVersion)
+
+	// 2. Clone cncf/landscape repo (shallow)
+	ghToken := os.Getenv("GH_TOKEN")
+	if ghToken == "" {
+		log.Fatal("GH_TOKEN environment variable is required")
+	}
+
+	tmpDir, err := os.MkdirTemp("", "landscape-*")
+	if err != nil {
+		log.Fatalf("Creating temp directory: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cloneURL := fmt.Sprintf("https://x-access-token:%s@github.com/cncf/landscape.git", ghToken)
+	log.Println("Cloning cncf/landscape (shallow)...")
+	if err := runCmd("git", "clone", "--depth", "1", cloneURL, tmpDir); err != nil {
+		log.Fatalf("Cloning landscape repo: %v", err)
+	}
+
+	// 3. Read landscape.yml
+	landscapePath := filepath.Join(tmpDir, "landscape.yml")
+	landscapeData, err := os.ReadFile(landscapePath)
+	if err != nil {
+		log.Fatalf("Reading landscape.yml: %v", err)
+	}
+
+	// 4. Search for existing entry
+	entry, err := findEntryInLandscape(landscapeData, meta.WebsiteURL)
+	if err != nil {
+		log.Fatalf("Searching landscape: %v", err)
+	}
+
+	var prBodyAction string
+
+	if entry != nil {
+		if entry.HasAIPlatformSecondPath {
+			// Already has AI Platform second_path — nothing to do
+			log.Printf("Entry %q already has Certified Kubernetes - AI Platform second_path. Nothing to do.", entry.Name)
+			return
+		}
+		// Found but no AI Platform — insert second_path
+		log.Printf("Found existing entry %q, adding AI Platform second_path...", entry.Name)
+		modified := insertSecondPath(landscapeData, entry)
+		if err := os.WriteFile(landscapePath, modified, 0644); err != nil {
+			log.Fatalf("Writing modified landscape.yml: %v", err)
+		}
+		prBodyAction = `This PR adds the "Certified Kubernetes - AI Platform" designation to the existing landscape entry via ` + "`second_path`."
+	} else {
+		// Not found — download logo and insert new entry
+		log.Printf("No existing entry found for %q, creating new entry...", meta.PlatformName)
+
+		logoFilename := sanitizeLogoName(meta.PlatformName)
+		if meta.ProductLogoURL != "" {
+			logoDestPath := filepath.Join(tmpDir, "hosted_logos", logoFilename)
+			if err := downloadLogo(meta.ProductLogoURL, logoDestPath); err != nil {
+				log.Printf("WARNING: Failed to download logo: %v (continuing without logo)", err)
+			} else {
+				log.Printf("Downloaded logo to %s", logoDestPath)
+			}
+		} else {
+			log.Println("WARNING: No productLogoUrl provided, skipping logo download")
+		}
+
+		modified, err := insertNewEntry(landscapeData, meta, logoFilename)
+		if err != nil {
+			log.Fatalf("Inserting new entry: %v", err)
+		}
+		if err := os.WriteFile(landscapePath, modified, 0644); err != nil {
+			log.Fatalf("Writing modified landscape.yml: %v", err)
+		}
+		prBodyAction = `This PR adds a new entry to the "Certified Kubernetes - AI Platform" subcategory.`
+	}
+
+	// 5. Create branch, commit, push
+	branchName := "ai-conformance/" + sanitizeBranchName(meta.PlatformName)
+	log.Printf("Creating branch %s...", branchName)
+
+	if err := runCmdInDir(tmpDir, "git", "checkout", "-b", branchName); err != nil {
+		log.Fatalf("Creating branch: %v", err)
+	}
+	if err := runCmdInDir(tmpDir, "git", "add", "-A"); err != nil {
+		log.Fatalf("Staging changes: %v", err)
+	}
+	commitMsg := fmt.Sprintf("Add %s to Certified Kubernetes - AI Platform", meta.PlatformName)
+	if err := runCmdInDir(tmpDir, "git", "commit", "-m", commitMsg); err != nil {
+		log.Fatalf("Committing changes: %v", err)
+	}
+	if err := runCmdInDir(tmpDir, "git", "push", "-u", "origin", branchName); err != nil {
+		log.Fatalf("Pushing branch: %v", err)
+	}
+
+	// 6. Open PR with gh CLI
+	prTitle := fmt.Sprintf("Add %s to Certified Kubernetes - AI Platform", meta.PlatformName)
+
+	submissionLine := ""
+	if prURL != "" {
+		submissionLine = fmt.Sprintf("**Conformance Submission:** %s\n", prURL)
+	}
+
+	prBody := fmt.Sprintf(`## AI Conformance Certification
+
+**Product:** %s
+**Vendor:** %s
+**Kubernetes Version:** %s
+%s
+%s
+
+Automated by [k8s-ai-conformance](https://github.com/cncf/k8s-ai-conformance).`,
+		meta.PlatformName,
+		meta.VendorName,
+		meta.KubernetesVersion,
+		submissionLine,
+		prBodyAction,
+	)
+
+	log.Println("Creating PR on cncf/landscape...")
+	if err := runCmdInDir(tmpDir, "gh", "pr", "create",
+		"--title", prTitle,
+		"--body", prBody,
+		"--reviewer", "taylorwaggoner",
+	); err != nil {
+		log.Fatalf("Creating PR: %v", err)
+	}
+
+	log.Println("Done! PR created successfully.")
 }
