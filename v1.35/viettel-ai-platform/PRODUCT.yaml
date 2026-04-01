@@ -9,6 +9,7 @@ metadata:
   vendorName: Viettel
   websiteUrl: https://viettelcloud.vn/
   documentationUrl: https://docs.viettelcloud.vn/documentation
+  productLogoUrl: "https://github.com/cncf/landscape/blob/master/hosted_logos/viettel.svg"
   description: Viettel AI Platform is a container management and orchestration platform based on Cloud Native architecture, designed to support AI/ML applications running in Kubernetes environments
   contactEmailAddress: vcloud@viettel.com.vn
   k8sConformanceUrl: "https://github.com/cncf/k8s-conformance/tree/master/v1.35/viettel-ai-platform"
