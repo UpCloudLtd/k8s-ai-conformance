@@ -163,9 +163,9 @@ The [Kubernetes AI Conformance](https://github.com/kubernetes-sigs/ai-conformanc
 ### Certified Platforms
 
 See all certified platforms in the version directories:
-- [v1.35/](v1.35/)
-- [v1.34/](v1.34/)
-- [v1.33/](v1.33/)
+- [v1.35/](/v1.35/)
+- [v1.34/](/v1.34/)
+- [v1.33/](/v1.33/)
 
 ### Need Help?
 
