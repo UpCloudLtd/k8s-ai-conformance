@@ -7,7 +7,7 @@ metadata:
   kubernetesVersion: v1.35
   platformName: "vCluster with Private Nodes"
   platformVersion: "v0.32.0"
-  vendorName: "vCluster Labs"
+  vendorName: "vCluster"
   websiteUrl: "https://www.vcluster.com/"
   repoUrl: "https://github.com/loft-sh/vcluster"
   documentationUrl: "https://www.vcluster.com/docs"
