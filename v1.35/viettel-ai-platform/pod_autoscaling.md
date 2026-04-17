@@ -219,6 +219,8 @@ This section validates HPA scaling based on custom GPU metrics from NVIDIA DCGM 
 
 ### Step 6: Install Prometheus
 
+DCGM Exporter runs as a DaemonSet in `gpu-operator`, with one pod per node exposing metrics at port 9400 with per-pod GPU utilization labels (`namespace`, `pod`, `container`). Prometheus scrapes all exporter pods:
+
 ```bash
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 helm repo update
@@ -233,8 +235,19 @@ server:
     enabled: false
   extraScrapeConfigs:
     - job_name: dcgm-exporter
-      static_configs:
-        - targets: ["nvidia-dcgm-exporter.gpu-operator.svc.cluster.local:9400"]
+      kubernetes_sd_configs:
+        - role: pod
+          namespaces:
+            names: ["gpu-operator"]
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_label_app]
+          action: keep
+          regex: nvidia-dcgm-exporter
+        - source_labels: [__address__]
+          action: replace
+          regex: (.+):.+
+          replacement: $1:9400
+          target_label: __address__
 EOF
 
 helm install prometheus prometheus-community/prometheus \
@@ -243,13 +256,10 @@ helm install prometheus prometheus-community/prometheus \
 ```
 
 ```bash
-$ kubectl get pods -n monitoring | grep -E 'NAME|prometheus'
-NAME                                             READY   STATUS    RESTARTS   AGE
-prometheus-adapter-bdf748cc-vtfdx                1/1     Running   0          5m45s
-prometheus-kube-state-metrics-675bd9d798-qf2zf   1/1     Running   0          7m21s
-prometheus-prometheus-node-exporter-zjp2z        1/1     Running   0          7m21s
-prometheus-prometheus-node-exporter-ztgxf        1/1     Running   0          7m21s
-prometheus-server-d766bd656-gv7wc                2/2     Running   0          7m21s
+$ kubectl get pods -n monitoring | grep -E 'NAME|prometheus-server|adapter'
+NAME                                   READY   STATUS    RESTARTS   AGE
+prometheus-adapter-7b88c9d9df-gxvhd   1/1     Running   0          47s
+prometheus-server-d766bd656-kh629      2/2     Running   0          62s
 ```
 
 ### Step 7: Install Prometheus Adapter
@@ -286,7 +296,9 @@ pods/dcgm_fi_dev_gpu_util
 namespaces/dcgm_fi_dev_gpu_util
 ```
 
-### Step 8: Deploy GPU Workload
+### Step 8: Deploy GPU Inference Workload with Load
+
+The GPU inference deployment runs continuous matrix multiplication (PyTorch) to sustain high GPU utilization, simulating an inference-under-load scenario:
 
 ```bash
 kubectl create namespace hpa-gpu-test
@@ -309,8 +321,17 @@ spec:
     spec:
       containers:
       - name: gpu-inference
-        image: nvidia/cuda:12.4.1-base-ubuntu22.04
-        command: ["sleep", "infinity"]
+        image: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+        command: ["python3", "-c"]
+        args:
+        - |
+          import torch, time
+          print('GPU:', torch.cuda.get_device_name(0), flush=True)
+          a = torch.randn(8192, 8192, device='cuda')
+          b = torch.randn(8192, 8192, device='cuda')
+          while True:
+            c = torch.mm(a, b)
+            torch.cuda.synchronize()
         resources:
           limits:
             nvidia.com/gpu: "1"
@@ -320,18 +341,21 @@ EOF
 ```bash
 $ kubectl get pods -n hpa-gpu-test
 NAME                             READY   STATUS    RESTARTS   AGE
-gpu-inference-7746ff8778-vldsn   1/1     Running   0          4m10s
+gpu-inference-5679dcc845-rthh8   1/1     Running   0          6m45s
+
+$ kubectl logs -n hpa-gpu-test -l app=gpu-inference --tail=2
+GPU: NVIDIA L40
 ```
 
-Confirm the pod-level GPU utilization metric is accessible:
+Confirm GPU utilization at 100% via DCGM Exporter:
 
 ```bash
 $ kubectl get --raw '/apis/custom.metrics.k8s.io/v1beta1/namespaces/hpa-gpu-test/pods/*/dcgm_fi_dev_gpu_util' \
     | python3 -c "import json,sys; d=json.load(sys.stdin); [print(i['describedObject']['name'], '->', i['value']) for i in d.get('items',[])]"
-gpu-inference-7746ff8778-vldsn -> 0
+gpu-inference-5679dcc845-rthh8 -> 100
 ```
 
-### Step 9: Create GPU Custom Metric HPA
+### Step 9: Create GPU Custom Metric HPA and Observe Scale-Out
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -358,13 +382,39 @@ spec:
 EOF
 ```
 
+HPA reads 100% GPU utilization (above the 50 target), triggering scale-out:
+
 ```bash
 $ kubectl get hpa gpu-inference-hpa -n hpa-gpu-test
 NAME                REFERENCE                  TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
-gpu-inference-hpa   Deployment/gpu-inference   0/50      1         4         1          3m15s
+gpu-inference-hpa   Deployment/gpu-inference   100/50    1         4         4          15d
+
+$ kubectl get pods -n hpa-gpu-test
+NAME                             READY   STATUS    RESTARTS   AGE
+gpu-inference-5679dcc845-c94dh   1/1     Running   0          33s
+gpu-inference-5679dcc845-njvjj   1/1     Running   0          3s
+gpu-inference-5679dcc845-qg5h6   1/1     Running   0          3s
+gpu-inference-5679dcc845-rthh8   1/1     Running   0          6m45s
 ```
 
-The HPA reads `dcgm_fi_dev_gpu_util` (current: `0`, target: `50`) via `custom.metrics.k8s.io`, confirming that GPU utilization metrics drive autoscaling decisions for AI inference workloads.
+HPA conditions and events confirm GPU-metric-driven scaling:
+
+```bash
+$ kubectl describe hpa gpu-inference-hpa -n hpa-gpu-test | grep -A20 'Conditions:'
+Conditions:
+  Type            Status  Reason              Message
+  ----            ------  ------              -------
+  AbleToScale     True    SucceededRescale    the HPA controller was able to update the target scale to 4
+  ScalingActive   True    ValidMetricFound    the HPA was able to successfully calculate a replica count from pods metric dcgm_fi_dev_gpu_util
+  ScalingLimited  False   DesiredWithinRange  the desired count is within the acceptable range
+Events:
+  Type    Reason             Age   From                       Message
+  ----    ------             ----  ----                       -------
+  Normal  SuccessfulRescale  38s   horizontal-pod-autoscaler  New size: 2; reason: pods metric dcgm_fi_dev_gpu_util above target
+  Normal  SuccessfulRescale  8s    horizontal-pod-autoscaler  New size: 4; reason: pods metric dcgm_fi_dev_gpu_util above target
+```
+
+Scaled from **1 → 4 replicas**, driven entirely by `dcgm_fi_dev_gpu_util` from NVIDIA DCGM Exporter.
 
 ## Cleanup (GPU HPA Test)
 
